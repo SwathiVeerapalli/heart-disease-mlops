@@ -257,6 +257,7 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v4
+        with: { ref: "${{ github.ref_name }}" }   # latest branch head, so re-runs never conflict
       - uses: actions/setup-python@v5
         with: { python-version: "${{ env.PYTHON_VERSION }}" }
       - uses: actions/download-artifact@v4
@@ -282,5 +283,5 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add data/processed reports screenshots
           git commit -m "Publish pipeline evidence for run ${{ github.run_number }} [skip ci]" || echo "nothing to commit"
-          git pull --rebase
+          git pull --rebase -X theirs
           git push
