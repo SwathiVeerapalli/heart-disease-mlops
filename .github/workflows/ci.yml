@@ -1,0 +1,286 @@
+name: ml-pipeline
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  PYTHON_VERSION: "3.11"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ------------------------------------------------------------------ 1. lint
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "${{ env.PYTHON_VERSION }}" }
+      - run: pip install ruff==0.17.1
+      - name: Ruff lint + format check
+        run: |
+          mkdir -p evidence
+          set -o pipefail
+          { echo "$ ruff check ." && ruff check . && echo && \
+            echo "$ ruff format --check ." && ruff format --check .; } 2>&1 | tee evidence/ci_01_lint.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: evidence-lint, path: evidence/ }
+
+  # ------------------------------------------------------------------ 2. unit tests
+  test:
+    needs: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "${{ env.PYTHON_VERSION }}"
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+      - run: pip install -r requirements-dev.txt
+      - name: Pytest with coverage
+        run: |
+          mkdir -p reports evidence
+          set -o pipefail
+          { echo "$ pytest -v --cov=heart --cov=app"; \
+            pytest -v --junitxml=reports/junit.xml --cov=heart --cov=app \
+              --cov-report=xml:reports/coverage.xml --cov-report=term; } 2>&1 | tee evidence/ci_02_unit_tests.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: test-reports, path: reports/ }
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: evidence-test, path: evidence/ }
+
+  # ------------------------------------------------------------------ 3. data + EDA + training
+  train:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "${{ env.PYTHON_VERSION }}"
+          cache: pip
+          cache-dependency-path: requirements.txt
+      - run: pip install -r requirements.txt
+      - name: Download, clean, EDA, train (MLflow)
+        run: |
+          mkdir -p evidence
+          set -o pipefail
+          { echo "$ python -m heart.download" && python -m heart.download && echo && \
+            echo "$ python -m heart.eda" && python -m heart.eda && echo && \
+            echo "$ python -m heart.train" && python -m heart.train 2>&1 | grep -v -i warning; } \
+            | tee evidence/ci_03_data_and_training.txt
+      - name: Job summary
+        run: |
+          echo "## Champion model" >> "$GITHUB_STEP_SUMMARY"
+          echo '```json' >> "$GITHUB_STEP_SUMMARY"
+          cat models/metadata.json >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: model
+          path: |
+            models/model.joblib
+            models/metadata.json
+      - uses: actions/upload-artifact@v4
+        with: { name: mlflow-runs, path: mlruns/, include-hidden-files: true }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: eda-and-plots
+          path: |
+            data/processed/heart_clean.csv
+            reports/
+            models/plots/
+      - uses: actions/upload-artifact@v4
+        with: { name: evidence-train, path: evidence/ }
+
+  # ------------------------------------------------------------------ 4. container build + smoke test
+  docker:
+    needs: train
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with: { name: model, path: models }
+      - name: Build image
+        run: docker build -t heart-api:${{ github.sha }} -t heart-api:1.0.0 .
+      - name: Run container and verify endpoints
+        run: |
+          mkdir -p evidence
+          OUT=evidence/docker_01_build_run_predict.txt
+          docker run -d --name api -p 8000:8000 heart-api:1.0.0
+          for i in $(seq 1 30); do curl -sf localhost:8000/health >/dev/null && break; sleep 2; done
+          {
+            echo "$ docker images heart-api"; docker images heart-api; echo
+            echo "$ docker ps"; docker ps --format 'table {{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}'; echo
+            echo "$ curl localhost:8000/health"; curl -sf localhost:8000/health; echo; echo
+            echo "$ curl -X POST localhost:8000/predict -d @sample_request.json"
+            curl -sf -X POST localhost:8000/predict -H 'Content-Type: application/json' \
+              -d @sample_request.json | python3 -m json.tool; echo
+            echo "$ curl -X POST localhost:8000/predict -d '{\"age\": -1}'   # invalid input"
+            curl -s -w '\nHTTP %{http_code}\n' -X POST localhost:8000/predict \
+              -H 'Content-Type: application/json' -d '{"age": -1}' | tail -c 300
+          } | tee "$OUT"
+          RESP=$(curl -sf -X POST localhost:8000/predict -H 'Content-Type: application/json' -d @sample_request.json)
+          echo "$RESP" | python3 -c "import sys,json; r=json.load(sys.stdin); assert r['prediction'] in (0,1) and 0.5<=r['confidence']<=1"
+          test "$(curl -s -o /dev/null -w '%{http_code}' -X POST localhost:8000/predict -H 'Content-Type: application/json' -d '{"age": -1}')" = "422"
+          { echo "$ docker logs api"; docker logs api 2>&1 | tail -15; } | tee evidence/docker_02_request_logs.txt
+      - name: Push to GitHub Container Registry
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        run: |
+          IMAGE=ghcr.io/$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')/heart-api
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          docker tag heart-api:1.0.0 "$IMAGE:${{ github.sha }}"
+          docker tag heart-api:1.0.0 "$IMAGE:latest"
+          docker push "$IMAGE:${{ github.sha }}"
+          docker push "$IMAGE:latest"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: evidence-docker, path: evidence/ }
+
+  # ------------------------------------------------------------------ 5. Kubernetes deployment (kind + NGINX Ingress)
+  deploy-k8s:
+    needs: docker
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with: { name: model, path: models }
+      - run: docker build -t heart-api:1.0.0 .
+      - uses: helm/kind-action@v1
+        with:
+          cluster_name: heart
+          config: k8s/kind/kind-config.yaml
+      - name: Install NGINX Ingress controller
+        run: |
+          kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/controller-v1.11.2/deploy/static/provider/kind/deploy.yaml
+          kubectl wait -n ingress-nginx --for=condition=ready pod \
+            --selector=app.kubernetes.io/component=controller --timeout=240s
+      - name: Deploy manifests
+        run: |
+          kind load docker-image heart-api:1.0.0 --name heart
+          kubectl apply -f k8s/00-namespace.yaml -f k8s/10-deployment.yaml \
+                        -f k8s/20-service.yaml -f k8s/30-ingress.yaml
+          kubectl -n heart-mlops rollout status deploy/heart-api --timeout=180s
+      - name: Verify endpoints through the Ingress
+        run: |
+          mkdir -p evidence
+          for i in $(seq 1 30); do
+            curl -sf -H 'Host: heart-api.local' localhost/health >/dev/null && break; sleep 3; done
+          {
+            echo "$ kubectl get nodes"; kubectl get nodes; echo
+            echo "$ kubectl -n heart-mlops get deploy,pods,svc,ingress -o wide"
+            kubectl -n heart-mlops get deploy,pods,svc,ingress -o wide
+          } | tee evidence/k8s_01_resources.txt
+          {
+            echo "$ curl -H 'Host: heart-api.local' http://localhost/health"
+            curl -sf -H 'Host: heart-api.local' localhost/health; echo; echo
+            echo "$ curl -H 'Host: heart-api.local' -X POST http://localhost/predict -d @sample_request.json"
+            curl -sf -H 'Host: heart-api.local' -X POST localhost/predict \
+              -H 'Content-Type: application/json' -d @sample_request.json | python3 -m json.tool
+            echo
+            echo "$ kubectl -n heart-mlops rollout history deploy/heart-api"
+            kubectl -n heart-mlops rollout history deploy/heart-api
+          } | tee evidence/k8s_02_ingress_predict.txt
+          { echo "$ kubectl -n heart-mlops logs -l app=heart-api --tail=8 --prefix"
+            kubectl -n heart-mlops logs -l app=heart-api --tail=8 --prefix; } | tee evidence/k8s_03_pod_logs.txt
+      - name: Debug on failure
+        if: failure()
+        run: |
+          kubectl get pods -A
+          kubectl -n heart-mlops describe pods
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: evidence-k8s, path: evidence/ }
+
+  # ------------------------------------------------------------------ 6. monitoring stack + UI screenshots
+  monitoring:
+    needs: [train, docker]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "${{ env.PYTHON_VERSION }}"
+          cache: pip
+          cache-dependency-path: requirements.txt
+      - uses: actions/download-artifact@v4
+        with: { name: model, path: models }
+      - uses: actions/download-artifact@v4
+        with: { name: mlflow-runs, path: mlruns }
+      - name: Install tooling
+        run: |
+          pip install -r requirements.txt playwright==1.48.0
+          python -m playwright install --with-deps chromium
+      - name: Start MLflow UI, API, Prometheus and Grafana
+        run: |
+          nohup mlflow ui --backend-store-uri ./mlruns --host 127.0.0.1 --port 5000 > mlflow.log 2>&1 &
+          docker compose -f monitoring/docker-compose.yml up -d --build
+          for i in $(seq 1 40); do curl -sf localhost:8000/health >/dev/null && break; sleep 3; done
+          for i in $(seq 1 40); do curl -sf localhost:3000/api/health >/dev/null && break; sleep 3; done
+          for i in $(seq 1 40); do curl -sf 127.0.0.1:5000 >/dev/null && break; sleep 3; done
+      - name: Generate traffic
+        run: |
+          bash monitoring/load_test.sh http://localhost:8000 300
+          sleep 30
+          bash monitoring/load_test.sh http://localhost:8000 200
+          sleep 30
+      - name: Capture screenshots
+        run: python scripts/capture_screenshots.py screenshots-ui
+      - name: Service logs on failure
+        if: failure()
+        run: |
+          cat mlflow.log || true
+          docker compose -f monitoring/docker-compose.yml logs --tail=50
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: screenshots-ui, path: screenshots-ui/ }
+
+  # ------------------------------------------------------------------ 7. publish evidence back to the repo
+  publish-evidence:
+    needs: [train, docker, deploy-k8s, monitoring]
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "${{ env.PYTHON_VERSION }}" }
+      - uses: actions/download-artifact@v4
+        with: { pattern: evidence-*, path: evidence, merge-multiple: true }
+      - uses: actions/download-artifact@v4
+        with: { name: screenshots-ui, path: screenshots }
+      - uses: actions/download-artifact@v4
+        with: { name: eda-and-plots, path: eda }
+      - name: Render terminal evidence
+        run: |
+          pip install playwright==1.48.0
+          python -m playwright install --with-deps chromium
+          python scripts/render_terminal.py evidence screenshots
+      - name: Commit cleaned dataset, EDA figures and screenshots
+        run: |
+          mkdir -p data/processed reports/figures reports/model_plots
+          cp eda/data/processed/heart_clean.csv data/processed/
+          cp eda/reports/figures/*.png reports/figures/
+          cp eda/reports/*.csv reports/
+          cp eda/models/plots/*.png reports/model_plots/
+          cp eda/models/plots/*.csv reports/model_plots/
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/processed reports screenshots
+          git commit -m "Publish pipeline evidence for run ${{ github.run_number }} [skip ci]" || echo "nothing to commit"
+          git pull --rebase
+          git push
