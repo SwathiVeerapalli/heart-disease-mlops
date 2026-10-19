@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+mlruns/
+mlartifacts/
+data/raw/
+models/*.joblib
+models/plots/
+reports/junit.xml
