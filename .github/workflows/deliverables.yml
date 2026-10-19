@@ -1,0 +1,54 @@
+name: deliverables
+
+# Builds the written report (DOCX + PDF) from the latest pipeline evidence and records
+# an MP4 walkthrough of the repository and pipeline run; commits both to deliverables/.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { ref: "${{ github.ref_name }}" }
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+      - uses: actions/setup-node@v4
+        with: { node-version: "20" }
+      - name: Install tooling
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends libreoffice-writer fonts-crosextra-carlito ffmpeg
+          pip install -q matplotlib==3.9.3 pillow==11.0.0 playwright==1.48.0
+          python -m playwright install --with-deps chromium
+          cd docs/report && npm install --no-save --no-package-lock docx@9.6.1
+      - name: Build report (DOCX + PDF)
+        run: |
+          python docs/report/prepare_images.py
+          (cd docs/report && node build_report.js)
+          (cd deliverables && soffice --headless --convert-to pdf MLOps_Assignment1_Report.docx)
+          ls -la deliverables
+      - name: Record walkthrough video (MP4)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          RUN_URL=$(gh api "repos/${{ github.repository }}/actions/workflows/ci.yml/runs?status=success&per_page=1" --jq '.workflow_runs[0].html_url')
+          echo "Latest successful pipeline run: $RUN_URL"
+          python docs/report/record_walkthrough.py "$RUN_URL" /tmp/walkthrough.webm
+          ffmpeg -y -loglevel error -i /tmp/walkthrough.webm -c:v libx264 -pix_fmt yuv420p \
+            -crf 26 -preset medium -movflags +faststart deliverables/pipeline_walkthrough.mp4
+          ffprobe -v error -show_entries format=duration,size -of default=nw=1 deliverables/pipeline_walkthrough.mp4
+      - uses: actions/upload-artifact@v4
+        with: { name: deliverables, path: deliverables/ }
+      - name: Commit deliverables to the repository
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add deliverables
+          git commit -m "Add report and pipeline walkthrough video [skip ci]" || echo "nothing to commit"
+          git pull --rebase -X theirs
+          git push
